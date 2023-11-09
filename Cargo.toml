@@ -1,0 +1,11 @@
+[package]
+name = "discog-xml-to-parquet"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+quick-xml = "0.29.0"
+flate2 = "1.0.26"
+parquet = "47.0.0"
+arrow = "47.0.0"
