@@ -17,22 +17,19 @@ use parquet::file::properties::WriterProperties;
 use arrow::array::{
     ListBuilder, StringArray, StringBuilder, StringDictionaryBuilder, UInt32Builder,
 };
-use arrow::datatypes::{DataType, Field, Int8Type, Schema, Utf8Type};
+use arrow::datatypes::{DataType, Field, Int8Type, Schema};
 use arrow::record_batch::RecordBatch;
 
 const READ_BUF_SIZE: usize = 1048576; // 1MB
 const BATCH_SIZE: usize = 10000;
 
 //TODO: Sort out unwraps
-
 //TODO: Result type alias
 
 #[derive(Debug)]
 enum ProcessingError {
-    //TOOD: Standardise on expected or unexpected, but not both
     ExpectedStart,
     ExpectedStartOf(&'static str),
-    ExpectedEnd(&'static str),
     ExpectedEndOf(&'static str),
     ExpectedEmpty(&'static str),
     ExpectedText,
@@ -73,7 +70,6 @@ impl EventReader {
     fn advance(&mut self) -> Result<Event, ProcessingError> {
         self.buf.clear();
         let event = self.reader.read_event_into(&mut self.buf)?;
-        //dbg!(&event);
         Ok(event)
     }
 }
@@ -157,7 +153,7 @@ impl<'a> EventExt<'a> for Event<'a> {
 
     fn is_empty_tag(&self) -> bool {
         match &self {
-            Event::Empty(e) => true,
+            Event::Empty(_) => true,
             _ => false,
         }
     }
@@ -224,6 +220,7 @@ impl ReleaseBatchWriter {
 
         let status_values =
             StringArray::from(vec![Some("Accepted"), Some("Draft"), Some("Deleted")]);
+
         ReleaseBatchWriter {
             writer,
             pending: 0,
@@ -344,11 +341,6 @@ fn parse_release_attributes(
 }
 
 fn parse_release(reader: &mut EventReader, release: &mut Release) -> Result<(), ProcessingError> {
-    //We can't assume the order of attributes within release
-
-    //parse_images(reader)?; // Images are ignored because uris are not in the dataset
-    //parse_artists(reader, release)?;
-
     loop {
         let event = reader.advance()?;
 
@@ -357,12 +349,12 @@ fn parse_release(reader: &mut EventReader, release: &mut Release) -> Result<(), 
         }
 
         if event.is_empty_tag() {
-            //dbg!(&event);
             continue;
         }
 
         let event = event.expect_start()?;
 
+        // We can't assume the order of elements within a release
         match event.name().into_inner() {
             b"title" => parse_title(reader, release)?,
             b"images" => parse_images(reader)?,
@@ -406,6 +398,7 @@ fn parse_title(reader: &mut EventReader, release: &mut Release) -> Result<(), Pr
 }
 
 fn parse_images(reader: &mut EventReader) -> Result<(), ProcessingError> {
+    // Images are ignored because uris are not in the dataset
     loop {
         let event = reader.advance()?;
 
