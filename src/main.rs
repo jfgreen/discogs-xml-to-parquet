@@ -17,7 +17,7 @@ use parquet::file::properties::WriterProperties;
 use arrow::array::{
     ListBuilder, StringArray, StringBuilder, StringDictionaryBuilder, UInt32Builder,
 };
-use arrow::datatypes::{DataType, Field, Int8Type, Schema};
+use arrow::datatypes::{DataType, Field, Int8Type, Schema, Utf8Type};
 use arrow::record_batch::RecordBatch;
 
 const READ_BUF_SIZE: usize = 1048576; // 1MB
@@ -112,6 +112,7 @@ impl<'a> EventExt<'a> for Event<'a> {
             _ => Err(ProcessingError::ExpectedStart),
         }
     }
+
     fn expect_end_of(self, name: &'static str) -> Result<(), ProcessingError> {
         match self {
             Event::End(e) if e.name().into_inner() == name.as_bytes() => Ok(()),
@@ -167,6 +168,8 @@ struct Release {
     id: u32,
     status: String,
     title: String,
+    //TODO: Try something that avoids re-allocation for each item,
+    genres: Vec<String>,
 }
 
 impl Release {
@@ -174,8 +177,16 @@ impl Release {
         self.id = Default::default();
         self.status.clear();
         self.title.clear();
+        self.genres.clear();
     }
 }
+
+//TODO: Things to try when it comes to writing lists
+// 1) Store references in Release (probably wont work, as underlying buffer gets re-used from one field to the next)
+// 2) Do the simple thing and have a list of strings in Release (re-allocate each time)
+// 3) Find a way to re-use a chunk of memory for the list (arrow types? something else?)
+// 4) Write straight to release batch writer? (but what about missing fields - rows become unaligned?)
+// 5) Use rust native Vec of String, but re-use Strings manually
 
 struct ReleaseBatchWriter {
     writer: ArrowWriter<File>,
@@ -183,6 +194,7 @@ struct ReleaseBatchWriter {
     ids: UInt32Builder,
     statuses: StringDictionaryBuilder<Int8Type>,
     titles: StringBuilder,
+    genres: ListBuilder<StringBuilder>,
     schema: Arc<Schema>,
 }
 
@@ -190,12 +202,15 @@ impl ReleaseBatchWriter {
     fn new(output_file_path: &str) -> Self {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::UInt32, false),
+            //TODO: Is dictionary encoding actually useful/working?
             Field::new(
                 "status",
                 DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
                 false,
             ),
             Field::new("title", DataType::Utf8, false),
+            //TODO: Should we dictionary encode this?
+            Field::new_list("genres", Field::new("item", DataType::Utf8, true), false),
         ]));
 
         let writer_properties = WriterProperties::builder()
@@ -215,6 +230,7 @@ impl ReleaseBatchWriter {
             ids: UInt32Builder::with_capacity(BATCH_SIZE),
             statuses: StringDictionaryBuilder::<Int8Type>::new_with_dictionary(3, &status_values)
                 .unwrap(),
+            genres: ListBuilder::new(StringBuilder::new()),
             titles: StringBuilder::with_capacity(BATCH_SIZE, 512),
             schema,
         }
@@ -224,6 +240,7 @@ impl ReleaseBatchWriter {
         self.ids.append_value(release.id);
         self.statuses.append_value(&release.status);
         self.titles.append_value(&release.title);
+        self.genres.append_value(release.genres.iter().map(Some));
         self.pending += 1;
 
         if self.pending == BATCH_SIZE {
@@ -241,6 +258,7 @@ impl ReleaseBatchWriter {
                             Arc::new(self.ids.finish()),
                             Arc::new(self.statuses.finish()),
                             Arc::new(self.titles.finish()),
+                            Arc::new(self.genres.finish()),
                         ],
                     )
                     .unwrap(),
@@ -352,7 +370,7 @@ fn parse_release(reader: &mut EventReader, release: &mut Release) -> Result<(), 
             b"extraartists" => parse_extra_artists(reader)?,
             b"labels" => parse_labels(reader)?,
             b"formats" => parse_formats(reader)?,
-            b"genres" => parse_genres(reader)?,
+            b"genres" => parse_genres(reader, release)?,
             b"country" => parse_country(reader)?,
             b"data_quality" => parse_data_quality(reader)?,
             b"master_id" => parse_master_id(reader)?,
@@ -443,14 +461,22 @@ fn parse_formats(reader: &mut EventReader) -> Result<(), ProcessingError> {
     }
 }
 
-fn parse_genres(reader: &mut EventReader) -> Result<(), ProcessingError> {
-    //TODO: Parse generes
+fn parse_genres(reader: &mut EventReader, release: &mut Release) -> Result<(), ProcessingError> {
     loop {
         let event = reader.advance()?;
 
         if event.is_end_of("genres") {
             break Ok(());
         }
+
+        event.expect_start_of("genre")?;
+
+        let genre = reader.advance()?.expect_text()?.into_inner();
+        let genre = std::str::from_utf8(&genre).unwrap();
+        let genre = genre.replace("&amp;", "&");
+        release.genres.push(String::from(genre));
+
+        reader.advance()?.expect_end_of("genre")?;
     }
 }
 
