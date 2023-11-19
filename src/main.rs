@@ -15,7 +15,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
 use arrow::array::{
-    ListBuilder, StringArray, StringBuilder, StringDictionaryBuilder, UInt32Builder,
+    ListBuilder, StringArray, StringBuilder, StringDictionaryBuilder, StructBuilder, UInt32Builder,
 };
 use arrow::datatypes::{DataType, Field, Int8Type, Schema};
 use arrow::record_batch::RecordBatch;
@@ -159,6 +159,7 @@ impl<'a> EventExt<'a> for Event<'a> {
     }
 }
 
+/*
 #[derive(Default)]
 struct Release {
     id: u32,
@@ -176,6 +177,7 @@ impl Release {
         self.genres.clear();
     }
 }
+*/
 
 //TODO: Things to try when it comes to writing lists
 // 1) Store references in Release (probably wont work, as underlying buffer gets re-used from one field to the next)
@@ -183,6 +185,8 @@ impl Release {
 // 3) Find a way to re-use a chunk of memory for the list (arrow types? something else?)
 // 4) Write straight to release batch writer? (but what about missing fields - rows become unaligned?)
 // 5) Use rust native Vec of String, but re-use Strings manually
+
+// Currently trying - 4) writing straight to reader
 
 struct ReleaseBatchWriter {
     writer: ArrowWriter<File>,
@@ -233,11 +237,30 @@ impl ReleaseBatchWriter {
         }
     }
 
-    fn add(&mut self, release: &Release) {
-        self.ids.append_value(release.id);
-        self.statuses.append_value(&release.status);
-        self.titles.append_value(&release.title);
-        self.genres.append_value(release.genres.iter().map(Some));
+    //TODO: For each of these "push" methods, we should record that this field,
+    // for the current record, has been populated. This will let us check for
+    // missing fields that would cause the columns to become un-aligned, but
+    // more importantly supply a null / default
+
+    fn push_id(&mut self, id: u32) {
+        self.ids.append_value(id);
+    }
+
+    fn push_status(&mut self, status: &str) {
+        self.statuses.append_value(status);
+    }
+    fn push_title(&mut self, title: &str) {
+        self.titles.append_value(title);
+    }
+
+    fn push_genre(&mut self, genre: &str) {
+        self.genres.values().append_value(genre);
+    }
+
+    fn write_release(&mut self) {
+        // Mark end of current release in list builders
+        self.genres.append(true);
+
         self.pending += 1;
 
         if self.pending == BATCH_SIZE {
@@ -275,15 +298,13 @@ fn main() -> Result<(), ProcessingError> {
     let (input_file_path, output_file_path) = read_args(env::args());
     let mut reader = EventReader::new(input_file_path)?;
 
-    let mut release_writer = ReleaseBatchWriter::new(&output_file_path);
-    let mut release = Release::default();
+    let mut writer = ReleaseBatchWriter::new(&output_file_path);
 
     reader.advance()?.expect_start_of("releases")?;
     reader.advance()?.expect_new_line()?;
 
     let mut n: u128 = 0;
 
-    //TODO: Nice abstraction that lets us iterate releases one at a time?
     loop {
         n += 1;
         let event = reader.advance()?;
@@ -294,17 +315,16 @@ fn main() -> Result<(), ProcessingError> {
 
         let release_start = event.expect_start_of("release")?;
 
-        parse_release_attributes(&release_start, &mut release)?;
-        parse_release(&mut reader, &mut release)?;
+        parse_release_attributes(&release_start, &mut writer)?;
+        parse_release(&mut reader, &mut writer)?;
 
-        release_writer.add(&release);
-        release.clear();
+        writer.write_release();
 
         if n % 10_000 == 0 {
             println!("{n}");
         }
     }
-    release_writer.close();
+    writer.close();
 
     reader.advance()?.expect_new_line()?;
     reader.advance()?.expect_eof()?;
@@ -315,7 +335,7 @@ fn main() -> Result<(), ProcessingError> {
 
 fn parse_release_attributes(
     release_start: &BytesStart,
-    release: &mut Release,
+    writer: &mut ReleaseBatchWriter,
 ) -> Result<(), ProcessingError> {
     //TODO: deal with unwraps
     for a in release_start.attributes() {
@@ -325,14 +345,14 @@ fn parse_release_attributes(
                 value: id,
             }) => {
                 let id = std::str::from_utf8(&id).unwrap().parse().unwrap();
-                release.id = id;
+                writer.push_id(id);
             }
             Ok(Attribute {
                 key: QName(b"status"),
                 value: status,
             }) => {
                 let status = std::str::from_utf8(&status).unwrap();
-                release.status.push_str(status);
+                writer.push_status(status);
             }
             _ => {} //TODO: This should be an error
         }
@@ -340,7 +360,10 @@ fn parse_release_attributes(
     Ok(())
 }
 
-fn parse_release(reader: &mut EventReader, release: &mut Release) -> Result<(), ProcessingError> {
+fn parse_release(
+    reader: &mut EventReader,
+    writer: &mut ReleaseBatchWriter,
+) -> Result<(), ProcessingError> {
     loop {
         let event = reader.advance()?;
 
@@ -356,13 +379,13 @@ fn parse_release(reader: &mut EventReader, release: &mut Release) -> Result<(), 
 
         // We can't assume the order of elements within a release
         match event.name().into_inner() {
-            b"title" => parse_title(reader, release)?,
+            b"title" => parse_title(reader, writer)?,
             b"images" => parse_images(reader)?,
             b"artists" => parse_artists(reader)?,
             b"extraartists" => parse_extra_artists(reader)?,
             b"labels" => parse_labels(reader)?,
             b"formats" => parse_formats(reader)?,
-            b"genres" => parse_genres(reader, release)?,
+            b"genres" => parse_genres(reader, writer)?,
             b"country" => parse_country(reader)?,
             b"data_quality" => parse_data_quality(reader)?,
             b"master_id" => parse_master_id(reader)?,
@@ -387,10 +410,13 @@ fn parse_release(reader: &mut EventReader, release: &mut Release) -> Result<(), 
     Ok(())
 }
 
-fn parse_title(reader: &mut EventReader, release: &mut Release) -> Result<(), ProcessingError> {
+fn parse_title(
+    reader: &mut EventReader,
+    writer: &mut ReleaseBatchWriter,
+) -> Result<(), ProcessingError> {
     let title = reader.advance()?.expect_text()?;
-
-    release.title.push_str(std::str::from_utf8(&title).unwrap());
+    let title = std::str::from_utf8(&title).unwrap();
+    writer.push_title(title);
 
     reader.advance()?.expect_end_of("title")?;
 
@@ -454,7 +480,10 @@ fn parse_formats(reader: &mut EventReader) -> Result<(), ProcessingError> {
     }
 }
 
-fn parse_genres(reader: &mut EventReader, release: &mut Release) -> Result<(), ProcessingError> {
+fn parse_genres(
+    reader: &mut EventReader,
+    writer: &mut ReleaseBatchWriter,
+) -> Result<(), ProcessingError> {
     loop {
         let event = reader.advance()?;
 
@@ -466,8 +495,9 @@ fn parse_genres(reader: &mut EventReader, release: &mut Release) -> Result<(), P
 
         let genre = reader.advance()?.expect_text()?.into_inner();
         let genre = std::str::from_utf8(&genre).unwrap();
+        //TODO: Can we do this without an alloc?
         let genre = genre.replace("&amp;", "&");
-        release.genres.push(String::from(genre));
+        writer.push_genre(&genre);
 
         reader.advance()?.expect_end_of("genre")?;
     }
