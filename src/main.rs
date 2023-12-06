@@ -195,6 +195,7 @@ struct ReleaseBatchWriter {
     statuses: StringDictionaryBuilder<Int8Type>,
     titles: StringBuilder,
     genres: ListBuilder<StringBuilder>,
+    styles: ListBuilder<StringBuilder>,
     schema: Arc<Schema>,
 }
 
@@ -209,8 +210,10 @@ impl ReleaseBatchWriter {
                 false,
             ),
             Field::new("title", DataType::Utf8, false),
-            //TODO: Should we dictionary encode this?
+            //TODO: Should we dictionary encode genres and styles?
+            //TODO: Can we verify which encoding is written
             Field::new_list("genres", Field::new("item", DataType::Utf8, true), false),
+            Field::new_list("styles", Field::new("item", DataType::Utf8, true), false),
         ]));
 
         let writer_properties = WriterProperties::builder()
@@ -231,8 +234,9 @@ impl ReleaseBatchWriter {
             ids: UInt32Builder::with_capacity(BATCH_SIZE),
             statuses: StringDictionaryBuilder::<Int8Type>::new_with_dictionary(3, &status_values)
                 .unwrap(),
-            genres: ListBuilder::new(StringBuilder::new()),
             titles: StringBuilder::with_capacity(BATCH_SIZE, 512),
+            genres: ListBuilder::new(StringBuilder::new()),
+            styles: ListBuilder::new(StringBuilder::new()),
             schema,
         }
     }
@@ -257,9 +261,14 @@ impl ReleaseBatchWriter {
         self.genres.values().append_value(genre);
     }
 
+    fn push_style(&mut self, style: &str) {
+        self.styles.values().append_value(style);
+    }
+
     fn write_release(&mut self) {
         // Mark end of current release in list builders
         self.genres.append(true);
+        self.styles.append(true);
 
         self.pending += 1;
 
@@ -279,6 +288,7 @@ impl ReleaseBatchWriter {
                             Arc::new(self.statuses.finish()),
                             Arc::new(self.titles.finish()),
                             Arc::new(self.genres.finish()),
+                            Arc::new(self.styles.finish()),
                         ],
                     )
                     .unwrap(),
@@ -380,12 +390,13 @@ fn parse_release(
         // We can't assume the order of elements within a release
         match event.name().into_inner() {
             b"title" => parse_title(reader, writer)?,
+            b"genres" => parse_genres(reader, writer)?,
+            b"styles" => parse_styles(reader, writer)?,
             b"images" => parse_images(reader)?,
             b"artists" => parse_artists(reader)?,
             b"extraartists" => parse_extra_artists(reader)?,
             b"labels" => parse_labels(reader)?,
             b"formats" => parse_formats(reader)?,
-            b"genres" => parse_genres(reader, writer)?,
             b"country" => parse_country(reader)?,
             b"data_quality" => parse_data_quality(reader)?,
             b"master_id" => parse_master_id(reader)?,
@@ -393,7 +404,6 @@ fn parse_release(
             b"videos" => parse_videos(reader)?,
             b"released" => parse_released(reader)?,
             b"companies" => parse_companies(reader)?,
-            b"styles" => parse_styles(reader)?,
             b"notes" => parse_notes(reader)?,
             b"identifiers" => parse_identifiers(reader)?,
             _ => {
@@ -421,6 +431,52 @@ fn parse_title(
     reader.advance()?.expect_end_of("title")?;
 
     Ok(())
+}
+
+fn parse_genres(
+    reader: &mut EventReader,
+    writer: &mut ReleaseBatchWriter,
+) -> Result<(), ProcessingError> {
+    loop {
+        let event = reader.advance()?;
+
+        if event.is_end_of("genres") {
+            break Ok(());
+        }
+
+        event.expect_start_of("genre")?;
+
+        let genre = reader.advance()?.expect_text()?.into_inner();
+        let genre = std::str::from_utf8(&genre).unwrap();
+        //TODO: Can we do this without an alloc?
+        let genre = genre.replace("&amp;", "&");
+        writer.push_genre(&genre);
+
+        reader.advance()?.expect_end_of("genre")?;
+    }
+}
+
+fn parse_styles(
+    reader: &mut EventReader,
+    writer: &mut ReleaseBatchWriter,
+) -> Result<(), ProcessingError> {
+    loop {
+        let event = reader.advance()?;
+
+        if event.is_end_of("styles") {
+            break Ok(());
+        }
+
+        event.expect_start_of("style")?;
+
+        let style = reader.advance()?.expect_text()?.into_inner();
+        let style = std::str::from_utf8(&style).unwrap();
+        //TODO: Can we do this without an alloc?
+        let style = style.replace("&amp;", "&");
+        writer.push_style(&style);
+
+        reader.advance()?.expect_end_of("style")?;
+    }
 }
 
 fn parse_images(reader: &mut EventReader) -> Result<(), ProcessingError> {
@@ -477,29 +533,6 @@ fn parse_formats(reader: &mut EventReader) -> Result<(), ProcessingError> {
         if event.is_end_of("formats") {
             break Ok(());
         }
-    }
-}
-
-fn parse_genres(
-    reader: &mut EventReader,
-    writer: &mut ReleaseBatchWriter,
-) -> Result<(), ProcessingError> {
-    loop {
-        let event = reader.advance()?;
-
-        if event.is_end_of("genres") {
-            break Ok(());
-        }
-
-        event.expect_start_of("genre")?;
-
-        let genre = reader.advance()?.expect_text()?.into_inner();
-        let genre = std::str::from_utf8(&genre).unwrap();
-        //TODO: Can we do this without an alloc?
-        let genre = genre.replace("&amp;", "&");
-        writer.push_genre(&genre);
-
-        reader.advance()?.expect_end_of("genre")?;
     }
 }
 
@@ -575,17 +608,6 @@ fn parse_companies(reader: &mut EventReader) -> Result<(), ProcessingError> {
         let event = reader.advance()?;
 
         if event.is_end_of("companies") {
-            break Ok(());
-        }
-    }
-}
-
-fn parse_styles(reader: &mut EventReader) -> Result<(), ProcessingError> {
-    //TODO: Parse styles
-    loop {
-        let event = reader.advance()?;
-
-        if event.is_end_of("styles") {
             break Ok(());
         }
     }
