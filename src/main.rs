@@ -17,14 +17,15 @@ use parquet::file::properties::WriterProperties;
 use arrow::array::{
     ListBuilder, StringArray, StringBuilder, StringDictionaryBuilder, StructBuilder, UInt32Builder,
 };
-use arrow::datatypes::{DataType, Field, Int8Type, Schema};
+use arrow::datatypes::{DataType, Field, Fields, Int8Type, Schema};
 use arrow::record_batch::RecordBatch;
 
 const READ_BUF_SIZE: usize = 1048576; // 1MB
 const BATCH_SIZE: usize = 10000;
 
-//TODO: Sort out unwraps
+//TODO: Sort out unwraps -> actually throw specific errors
 //TODO: Result type alias
+//TODO: Consider macros for common attribute wrangling
 
 #[derive(Debug)]
 enum ProcessingError {
@@ -145,48 +146,13 @@ impl<'a> EventExt<'a> for Event<'a> {
     }
 
     fn is_end_of(&self, name: &'static str) -> bool {
-        match &self {
-            Event::End(e) if e.name().into_inner() == name.as_bytes() => true,
-            _ => false,
-        }
+        matches!(&self, Event::End(e) if e.name().into_inner() == name.as_bytes())
     }
 
     fn is_empty_tag(&self) -> bool {
-        match &self {
-            Event::Empty(_) => true,
-            _ => false,
-        }
+        matches!(&self, Event::Empty(_))
     }
 }
-
-/*
-#[derive(Default)]
-struct Release {
-    id: u32,
-    status: String,
-    title: String,
-    //TODO: Try something that avoids re-allocation for each item,
-    genres: Vec<String>,
-}
-
-impl Release {
-    fn clear(&mut self) {
-        self.id = Default::default();
-        self.status.clear();
-        self.title.clear();
-        self.genres.clear();
-    }
-}
-*/
-
-//TODO: Things to try when it comes to writing lists
-// 1) Store references in Release (probably wont work, as underlying buffer gets re-used from one field to the next)
-// 2) Do the simple thing and have a list of strings in Release (re-allocate each time)
-// 3) Find a way to re-use a chunk of memory for the list (arrow types? something else?)
-// 4) Write straight to release batch writer? (but what about missing fields - rows become unaligned?)
-// 5) Use rust native Vec of String, but re-use Strings manually
-
-// Currently trying - 4) writing straight to reader
 
 struct ReleaseBatchWriter {
     writer: ArrowWriter<File>,
@@ -196,11 +162,18 @@ struct ReleaseBatchWriter {
     titles: StringBuilder,
     genres: ListBuilder<StringBuilder>,
     styles: ListBuilder<StringBuilder>,
+    labels: ListBuilder<StructBuilder>,
     schema: Arc<Schema>,
 }
 
 impl ReleaseBatchWriter {
     fn new(output_file_path: &str) -> Self {
+        let label_fields = Fields::from(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("cat_no", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
+        ]);
+
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::UInt32, false),
             //TODO: Is dictionary encoding actually useful/working?
@@ -211,9 +184,14 @@ impl ReleaseBatchWriter {
             ),
             Field::new("title", DataType::Utf8, false),
             //TODO: Should we dictionary encode genres and styles?
-            //TODO: Can we verify which encoding is written
+            //TODO: Can we verify which encoding is written?
             Field::new_list("genres", Field::new("item", DataType::Utf8, true), false),
             Field::new_list("styles", Field::new("item", DataType::Utf8, true), false),
+            Field::new_list(
+                "labels",
+                Field::new_struct("item", label_fields.clone(), true),
+                false,
+            ),
         ]));
 
         let writer_properties = WriterProperties::builder()
@@ -228,6 +206,8 @@ impl ReleaseBatchWriter {
         let status_values =
             StringArray::from(vec![Some("Accepted"), Some("Draft"), Some("Deleted")]);
 
+        //TODO: Review default capacities.
+
         ReleaseBatchWriter {
             writer,
             pending: 0,
@@ -237,11 +217,19 @@ impl ReleaseBatchWriter {
             titles: StringBuilder::with_capacity(BATCH_SIZE, 512),
             genres: ListBuilder::new(StringBuilder::new()),
             styles: ListBuilder::new(StringBuilder::new()),
+            labels: ListBuilder::new(StructBuilder::new(
+                label_fields,
+                vec![
+                    Box::new(StringBuilder::new()),
+                    Box::new(StringBuilder::new()),
+                    Box::new(StringBuilder::new()),
+                ],
+            )),
             schema,
         }
     }
 
-    //TODO: For each of these "push" methods, we should record that this field,
+    //TODO: For each of these "push" methods, we could record that this field,
     // for the current record, has been populated. This will let us check for
     // missing fields that would cause the columns to become un-aligned, but
     // more importantly supply a null / default
@@ -265,10 +253,41 @@ impl ReleaseBatchWriter {
         self.styles.values().append_value(style);
     }
 
+    fn push_label_id(&mut self, id: &str) {
+        //TODO: Is there a nicer way than this?
+        self.labels
+            .values()
+            .field_builder::<StringBuilder>(0)
+            .unwrap()
+            .append_value(id);
+    }
+
+    fn push_label_cat_no(&mut self, cat_no: &str) {
+        //TODO: Is there a nicer way than this?
+        self.labels
+            .values()
+            .field_builder::<StringBuilder>(1)
+            .unwrap()
+            .append_value(cat_no);
+    }
+    fn push_label_name(&mut self, name: &str) {
+        //TODO: Is there a nicer way than this?
+        self.labels
+            .values()
+            .field_builder::<StringBuilder>(2)
+            .unwrap()
+            .append_value(name);
+    }
+
+    fn push_end_of_label(&mut self) {
+        self.labels.values().append(true);
+    }
+
     fn write_release(&mut self) {
         // Mark end of current release in list builders
         self.genres.append(true);
         self.styles.append(true);
+        self.labels.append(true);
 
         self.pending += 1;
 
@@ -289,6 +308,7 @@ impl ReleaseBatchWriter {
                             Arc::new(self.titles.finish()),
                             Arc::new(self.genres.finish()),
                             Arc::new(self.styles.finish()),
+                            Arc::new(self.labels.finish()),
                         ],
                     )
                     .unwrap(),
@@ -395,7 +415,7 @@ fn parse_release(
             b"images" => parse_images(reader)?,
             b"artists" => parse_artists(reader)?,
             b"extraartists" => parse_extra_artists(reader)?,
-            b"labels" => parse_labels(reader)?,
+            b"labels" => parse_labels(reader, writer)?,
             b"formats" => parse_formats(reader)?,
             b"country" => parse_country(reader)?,
             b"data_quality" => parse_data_quality(reader)?,
@@ -479,6 +499,50 @@ fn parse_styles(
     }
 }
 
+fn parse_labels(
+    reader: &mut EventReader,
+    writer: &mut ReleaseBatchWriter,
+) -> Result<(), ProcessingError> {
+    loop {
+        let event = reader.advance()?;
+
+        if event.is_end_of("labels") {
+            break Ok(());
+        }
+
+        let label = event.expect_empty("label")?;
+
+        for a in label.attributes() {
+            match a {
+                Ok(Attribute {
+                    key: QName(b"id"),
+                    value: id,
+                }) => {
+                    let id = std::str::from_utf8(&id).unwrap();
+                    writer.push_label_id(id);
+                }
+                Ok(Attribute {
+                    key: QName(b"catno"),
+                    value: cat_no,
+                }) => {
+                    let cat_no = std::str::from_utf8(&cat_no).unwrap();
+                    writer.push_label_cat_no(cat_no);
+                }
+                Ok(Attribute {
+                    key: QName(b"name"),
+                    value: name,
+                }) => {
+                    let name = std::str::from_utf8(&name).unwrap();
+                    writer.push_label_name(name);
+                }
+                _ => {} //TODO: This should be an error
+            }
+        }
+
+        writer.push_end_of_label();
+    }
+}
+
 fn parse_images(reader: &mut EventReader) -> Result<(), ProcessingError> {
     // Images are ignored because uris are not in the dataset
     loop {
@@ -509,17 +573,6 @@ fn parse_extra_artists(reader: &mut EventReader) -> Result<(), ProcessingError> 
         let event = reader.advance()?;
 
         if event.is_end_of("extraartists") {
-            break Ok(());
-        }
-    }
-}
-
-fn parse_labels(reader: &mut EventReader) -> Result<(), ProcessingError> {
-    //TODO: Parse labels
-    loop {
-        let event = reader.advance()?;
-
-        if event.is_end_of("labels") {
             break Ok(());
         }
     }
