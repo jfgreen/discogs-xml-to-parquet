@@ -160,6 +160,7 @@ struct ReleaseBatchWriter {
     ids: UInt32Builder,
     statuses: StringDictionaryBuilder<Int8Type>,
     titles: StringBuilder,
+    artists: ListBuilder<StructBuilder>,
     genres: ListBuilder<StringBuilder>,
     styles: ListBuilder<StringBuilder>,
     labels: ListBuilder<StructBuilder>,
@@ -174,6 +175,13 @@ impl ReleaseBatchWriter {
             Field::new("name", DataType::Utf8, false),
         ]);
 
+        let artist_fields = Fields::from(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("anv", DataType::Utf8, true),
+            Field::new("join", DataType::Utf8, true),
+        ]);
+
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::UInt32, false),
             //TODO: Is dictionary encoding actually useful/working?
@@ -183,6 +191,11 @@ impl ReleaseBatchWriter {
                 false,
             ),
             Field::new("title", DataType::Utf8, false),
+            Field::new_list(
+                "artists",
+                Field::new_struct("item", artist_fields.clone(), true),
+                false,
+            ),
             //TODO: Should we dictionary encode genres and styles?
             //TODO: Can we verify which encoding is written?
             Field::new_list("genres", Field::new("item", DataType::Utf8, true), false),
@@ -215,14 +228,25 @@ impl ReleaseBatchWriter {
             statuses: StringDictionaryBuilder::<Int8Type>::new_with_dictionary(3, &status_values)
                 .unwrap(),
             titles: StringBuilder::with_capacity(BATCH_SIZE, 512),
+            artists: ListBuilder::new(StructBuilder::new(
+                artist_fields,
+                vec![
+                    //TODO: This seems a bit fragile?
+                    Box::new(StringBuilder::new()), // id
+                    Box::new(StringBuilder::new()), // name
+                    Box::new(StringBuilder::new()), // anv
+                    Box::new(StringBuilder::new()), // join
+                ],
+            )),
             genres: ListBuilder::new(StringBuilder::new()),
             styles: ListBuilder::new(StringBuilder::new()),
             labels: ListBuilder::new(StructBuilder::new(
                 label_fields,
                 vec![
-                    Box::new(StringBuilder::new()),
-                    Box::new(StringBuilder::new()),
-                    Box::new(StringBuilder::new()),
+                    //TODO: This seems a bit fragile?
+                    Box::new(StringBuilder::new()), // id
+                    Box::new(StringBuilder::new()), // cat no
+                    Box::new(StringBuilder::new()), // name
                 ],
             )),
             schema,
@@ -243,6 +267,60 @@ impl ReleaseBatchWriter {
     }
     fn push_title(&mut self, title: &str) {
         self.titles.append_value(title);
+    }
+
+    //TODO: Is there a way to define the order of struct in one place, safely.
+
+    fn push_artist_id(&mut self, id: &str) {
+        self.artists
+            .values()
+            .field_builder::<StringBuilder>(0)
+            .unwrap()
+            .append_value(id)
+    }
+
+    fn push_artist_name(&mut self, name: &str) {
+        self.artists
+            .values()
+            .field_builder::<StringBuilder>(1)
+            .unwrap()
+            .append_value(name)
+    }
+
+    fn push_artist_anv(&mut self, anv: &str) {
+        self.artists
+            .values()
+            .field_builder::<StringBuilder>(2)
+            .unwrap()
+            .append_value(anv)
+    }
+
+    fn push_artist_anv_null(&mut self) {
+        self.artists
+            .values()
+            .field_builder::<StringBuilder>(2)
+            .unwrap()
+            .append_null()
+    }
+
+    fn push_artist_join(&mut self, join: &str) {
+        self.artists
+            .values()
+            .field_builder::<StringBuilder>(3)
+            .unwrap()
+            .append_value(join)
+    }
+
+    fn push_artist_join_null(&mut self) {
+        self.artists
+            .values()
+            .field_builder::<StringBuilder>(3)
+            .unwrap()
+            .append_null()
+    }
+
+    fn push_end_of_artist(&mut self) {
+        self.artists.values().append(true)
     }
 
     fn push_genre(&mut self, genre: &str) {
@@ -285,6 +363,7 @@ impl ReleaseBatchWriter {
 
     fn write_release(&mut self) {
         // Mark end of current release in list builders
+        self.artists.append(true);
         self.genres.append(true);
         self.styles.append(true);
         self.labels.append(true);
@@ -306,6 +385,7 @@ impl ReleaseBatchWriter {
                             Arc::new(self.ids.finish()),
                             Arc::new(self.statuses.finish()),
                             Arc::new(self.titles.finish()),
+                            Arc::new(self.artists.finish()),
                             Arc::new(self.genres.finish()),
                             Arc::new(self.styles.finish()),
                             Arc::new(self.labels.finish()),
@@ -413,7 +493,7 @@ fn parse_release(
             b"genres" => parse_genres(reader, writer)?,
             b"styles" => parse_styles(reader, writer)?,
             b"images" => parse_images(reader)?,
-            b"artists" => parse_artists(reader)?,
+            b"artists" => parse_artists(reader, writer)?,
             b"extraartists" => parse_extra_artists(reader)?,
             b"labels" => parse_labels(reader, writer)?,
             b"formats" => parse_formats(reader)?,
@@ -543,6 +623,94 @@ fn parse_labels(
     }
 }
 
+fn parse_artists(
+    reader: &mut EventReader,
+    writer: &mut ReleaseBatchWriter,
+) -> Result<(), ProcessingError> {
+    loop {
+        let event = reader.advance()?;
+
+        if event.is_end_of("artists") {
+            break Ok(());
+        }
+
+        event.expect_start_of("artist")?;
+
+        parse_artist(reader, writer)?;
+    }
+}
+
+fn parse_artist(
+    reader: &mut EventReader,
+    writer: &mut ReleaseBatchWriter,
+) -> Result<(), ProcessingError> {
+    loop {
+        let event = reader.advance()?;
+
+        if event.is_end_of("artist") {
+            writer.push_end_of_artist();
+            break Ok(());
+        }
+
+        let event = event.expect_start()?;
+
+        match event.name().into_inner() {
+            b"id" => {
+                // Id should never be null
+                let event = reader.advance()?;
+                let id = event.expect_text()?;
+                let id = std::str::from_utf8(&id).unwrap();
+                writer.push_artist_id(id);
+                reader.advance()?.expect_end_of("id")?;
+            }
+            b"name" => {
+                // Name should never be null
+                let event = reader.advance()?;
+                let name = event.expect_text()?;
+                let name = std::str::from_utf8(&name).unwrap();
+                writer.push_artist_name(name);
+                reader.advance()?.expect_end_of("name")?;
+            }
+            b"anv" => {
+                // Artist name variation can be null
+                let event = reader.advance()?;
+                if event.is_end_of("anv") {
+                    writer.push_artist_anv_null();
+                } else {
+                    let anv = event.expect_text()?;
+                    let anv = std::str::from_utf8(&anv).unwrap();
+                    writer.push_artist_anv(anv);
+                    reader.advance()?.expect_end_of("anv")?;
+                }
+            }
+            b"join" => {
+                // Join field can be null
+                let event = reader.advance()?;
+                if event.is_end_of("join") {
+                    writer.push_artist_join_null();
+                } else {
+                    let join = event.expect_text()?;
+                    let join = std::str::from_utf8(&join).unwrap();
+                    writer.push_artist_join(join);
+                    reader.advance()?.expect_end_of("join")?;
+                }
+            }
+            b"role" => {
+                // Tracks never seems to hold a value for main artist, so we can skip
+                reader.advance()?.expect_end_of("role")?;
+            }
+            b"tracks" => {
+                // Tracks never seems to hold a value for main artist, so we can skip
+                reader.advance()?.expect_end_of("tracks")?;
+            }
+            _ => {
+                dbg!(&event);
+                panic!("oh no"); //TODO: This should by an error
+            }
+        }
+    }
+}
+
 fn parse_images(reader: &mut EventReader) -> Result<(), ProcessingError> {
     // Images are ignored because uris are not in the dataset
     loop {
@@ -553,17 +721,6 @@ fn parse_images(reader: &mut EventReader) -> Result<(), ProcessingError> {
         }
 
         event.expect_empty("image")?;
-    }
-}
-
-fn parse_artists(reader: &mut EventReader) -> Result<(), ProcessingError> {
-    //TODO: Parse artists
-    loop {
-        let event = reader.advance()?;
-
-        if event.is_end_of("artists") {
-            break Ok(());
-        }
     }
 }
 
