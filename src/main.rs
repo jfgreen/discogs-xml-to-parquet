@@ -15,7 +15,8 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
 use arrow::array::{
-    ListBuilder, StringArray, StringBuilder, StringDictionaryBuilder, StructBuilder, UInt32Builder,
+    BooleanBuilder, ListBuilder, StringArray, StringBuilder, StringDictionaryBuilder,
+    StructBuilder, UInt32Builder,
 };
 use arrow::datatypes::{DataType, Field, Fields, Int8Type, Schema};
 use arrow::record_batch::RecordBatch;
@@ -26,6 +27,7 @@ const BATCH_SIZE: usize = 10000;
 //TODO: Sort out unwraps -> actually throw specific errors
 //TODO: Result type alias
 //TODO: Consider macros for common attribute wrangling
+//TODO: Tests, tests and more tests
 
 #[derive(Debug)]
 enum ProcessingError {
@@ -154,9 +156,11 @@ impl<'a> EventExt<'a> for Event<'a> {
     }
 }
 
+//TODO: Figure out order, make consistent
 struct ReleaseBatchWriter {
     writer: ArrowWriter<File>,
     pending: usize,
+    //TODO: Lose plural where value in a single row is not a list
     ids: UInt32Builder,
     statuses: StringDictionaryBuilder<Int8Type>,
     titles: StringBuilder,
@@ -164,11 +168,14 @@ struct ReleaseBatchWriter {
     genres: ListBuilder<StringBuilder>,
     styles: ListBuilder<StringBuilder>,
     labels: ListBuilder<StructBuilder>,
+    is_main_release: BooleanBuilder,
+    master_id: UInt32Builder,
     schema: Arc<Schema>,
 }
 
 impl ReleaseBatchWriter {
     fn new(output_file_path: &str) -> Self {
+        //TODO: All ids should be probably be numeric
         let label_fields = Fields::from(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("cat_no", DataType::Utf8, false),
@@ -205,6 +212,8 @@ impl ReleaseBatchWriter {
                 Field::new_struct("item", label_fields.clone(), true),
                 false,
             ),
+            Field::new("is_main_release", DataType::Boolean, true),
+            Field::new("master_id", DataType::UInt32, true),
         ]));
 
         let writer_properties = WriterProperties::builder()
@@ -249,6 +258,8 @@ impl ReleaseBatchWriter {
                     Box::new(StringBuilder::new()), // name
                 ],
             )),
+            is_main_release: BooleanBuilder::new(),
+            master_id: UInt32Builder::new(),
             schema,
         }
     }
@@ -361,6 +372,22 @@ impl ReleaseBatchWriter {
         self.labels.values().append(true);
     }
 
+    fn push_is_main_release(&mut self, is_main: bool) {
+        self.is_main_release.append_value(is_main)
+    }
+
+    fn push_is_main_release_null(&mut self) {
+        self.is_main_release.append_null()
+    }
+
+    fn push_master_id(&mut self, id: u32) {
+        self.master_id.append_value(id);
+    }
+
+    fn push_master_id_null(&mut self) {
+        self.master_id.append_null();
+    }
+
     fn write_release(&mut self) {
         // Mark end of current release in list builders
         self.artists.append(true);
@@ -389,6 +416,8 @@ impl ReleaseBatchWriter {
                             Arc::new(self.genres.finish()),
                             Arc::new(self.styles.finish()),
                             Arc::new(self.labels.finish()),
+                            Arc::new(self.is_main_release.finish()),
+                            Arc::new(self.master_id.finish()),
                         ],
                     )
                     .unwrap(),
@@ -464,7 +493,11 @@ fn parse_release_attributes(
                 let status = std::str::from_utf8(&status).unwrap();
                 writer.push_status(status);
             }
-            _ => {} //TODO: This should be an error
+            _ => {
+                //TODO: This should be an error
+                dbg!(a);
+                panic!();
+            }
         }
     }
     Ok(())
@@ -474,6 +507,7 @@ fn parse_release(
     reader: &mut EventReader,
     writer: &mut ReleaseBatchWriter,
 ) -> Result<(), ProcessingError> {
+    let mut has_master_id = false;
     loop {
         let event = reader.advance()?;
 
@@ -487,6 +521,8 @@ fn parse_release(
 
         let event = event.expect_start()?;
 
+        //TODO: Figure out a nice way to make sure we get each of these once
+
         // We can't assume the order of elements within a release
         match event.name().into_inner() {
             b"title" => parse_title(reader, writer)?,
@@ -499,13 +535,17 @@ fn parse_release(
             b"formats" => parse_formats(reader)?,
             b"country" => parse_country(reader)?,
             b"data_quality" => parse_data_quality(reader)?,
-            b"master_id" => parse_master_id(reader)?,
             b"tracklist" => parse_tracklist(reader)?,
             b"videos" => parse_videos(reader)?,
             b"released" => parse_released(reader)?,
             b"companies" => parse_companies(reader)?,
             b"notes" => parse_notes(reader)?,
             b"identifiers" => parse_identifiers(reader)?,
+            b"master_id" => {
+                parse_master_id_attributes(&event, writer)?;
+                parse_master_id(reader, writer)?;
+                has_master_id = true;
+            }
             _ => {
                 dbg!(&event);
                 dbg!(&event.name().into_inner());
@@ -513,6 +553,10 @@ fn parse_release(
                 panic!();
             }
         }
+    }
+    if !has_master_id {
+        writer.push_is_main_release_null();
+        writer.push_master_id_null();
     }
 
     reader.advance()?.expect_new_line()?;
@@ -768,15 +812,42 @@ fn parse_data_quality(reader: &mut EventReader) -> Result<(), ProcessingError> {
     }
 }
 
-fn parse_master_id(reader: &mut EventReader) -> Result<(), ProcessingError> {
-    //TODO: Parse master_id
-    loop {
-        let event = reader.advance()?;
+fn parse_master_id_attributes(
+    master_id_start: &BytesStart,
+    writer: &mut ReleaseBatchWriter,
+) -> Result<(), ProcessingError> {
+    //TODO: Parse master_id attributes
 
-        if event.is_end_of("master_id") {
-            break Ok(());
-        }
+    if let Some(Ok(Attribute {
+        key: QName(b"is_main_release"),
+        value: is_main,
+    })) = master_id_start.attributes().next()
+    {
+        let is_main = match is_main.as_ref() {
+            b"true" => true,
+            b"false" => false,
+            _ => panic!(),
+        };
+
+        writer.push_is_main_release(is_main);
+    } else {
+        //TODO: Real error
+        panic!()
     }
+
+    Ok(())
+}
+
+fn parse_master_id(
+    reader: &mut EventReader,
+    writer: &mut ReleaseBatchWriter,
+) -> Result<(), ProcessingError> {
+    let master_id = reader.advance()?.expect_text()?;
+    let master_id = std::str::from_utf8(&master_id).unwrap().parse().unwrap();
+    writer.push_master_id(master_id);
+
+    reader.advance()?.expect_end_of("master_id")?;
+    Ok(())
 }
 
 fn parse_tracklist(reader: &mut EventReader) -> Result<(), ProcessingError> {
